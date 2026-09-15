@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+
+import os
+import glob
+import subprocess
+import time
+import gi
+
+gi.require_version('Gtk', '3.0')
+
+try:
+    gi.require_version('AppIndicator3', '0.1')
+    from gi.repository import AppIndicator3 as appindicator
+except ValueError:
+    gi.require_version('AyatanaAppIndicator3', '0.1')
+    from gi.repository import AyatanaAppIndicator3 as appindicator
+
+from gi.repository import Gtk, GLib
+
+APPIMAGE_DIR = os.path.expanduser("~/.local/share/wg-tray/icons")
+CHECK_INTERVAL_MS = 3000
+APP_TITLE = "Wireguard Connection Manager"
+
+
+class WireGuardTray:
+    def __init__(self):
+        os.makedirs(APPIMAGE_DIR, exist_ok=True)
+        self.create_icons()
+
+        self.indicator = appindicator.Indicator.new(
+            "wireguard-status-tray",
+            os.path.join(APPIMAGE_DIR, "wg-disconnected.svg"),
+            appindicator.IndicatorCategory.APPLICATION_STATUS
+        )
+        self.indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
+
+        self.menu = Gtk.Menu()
+        self.indicator.set_menu(self.menu)
+
+        # Dictionary structure: { tunnel_name: {"item": Gtk.CheckMenuItem, "handler_id": int} }
+        self.tunnel_items = {}
+        self.no_tunnels_item = None
+
+        self.update_status()
+        GLib.timeout_add(CHECK_INTERVAL_MS, self.update_status)
+
+    def create_icons(self):
+        icons = {
+            "wg-connected.svg": '<svg width="64" height="64" viewBox="0 0 64 64"><path d="M10 15 L28 50 L54 15" fill="none" stroke="#00FF00" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+            "wg-disconnected.svg": '<svg width="64" height="64" viewBox="0 0 64 64"><path d="M10 15 L28 50 L54 15" fill="none" stroke="#FF0000" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+        }
+        for name, svg_content in icons.items():
+            svg_path = os.path.join(APPIMAGE_DIR, name)
+            if not os.path.exists(svg_path):
+                with open(svg_path, 'w') as f:
+                    f.write(svg_content)
+
+    def get_available_tunnels(self):
+        conf_files = glob.glob("/etc/wireguard/*.conf")
+        return sorted([os.path.splitext(os.path.basename(f))[0] for f in conf_files])
+
+    def get_active_interfaces(self):
+        active = []
+        try:
+            ifaces = os.listdir('/sys/class/net/')
+            for iface in ifaces:
+                operstate_path = f'/sys/class/net/{iface}/operstate'
+                if os.path.exists(operstate_path):
+                    with open(operstate_path, 'r') as f:
+                        state = f.read().strip()
+                    if state in ['unknown', 'up']:
+                        type_path = f'/sys/class/net/{iface}/type'
+                        if os.path.exists(type_path):
+                            with open(type_path, 'r') as t:
+                                if t.read().strip() in ['65534', '1']:
+                                    active.append(iface)
+        except Exception:
+            pass
+        return active
+
+    def on_tunnel_toggled(self, widget, tunnel_name):
+        """Triggers when the user clicks a CheckMenuItem."""
+        is_connected = widget.get_active()
+        action = "up" if is_connected else "down"
+        cmd = ["pkexec", "wg-quick", action, tunnel_name]
+        try:
+            subprocess.Popen(cmd)
+        except Exception as e:
+            print(f"Error toggling tunnel {tunnel_name}: {e}")
+
+        GLib.timeout_add(500, self.update_status)
+
+    def update_menu(self, available_tunnels, active_tunnels):
+        current_set = set(available_tunnels)
+        existing_set = set(self.tunnel_items.keys())
+
+        # Rebuild layout only when available .conf files change
+        if current_set != existing_set:
+            for item in self.menu.get_children():
+                self.menu.remove(item)
+            self.tunnel_items.clear()
+
+            if not available_tunnels:
+                self.no_tunnels_item = Gtk.MenuItem(label="No .conf files in /etc/wireguard/")
+                self.no_tunnels_item.set_sensitive(False)
+                self.menu.append(self.no_tunnels_item)
+            else:
+                for tunnel in available_tunnels:
+                    item = Gtk.CheckMenuItem(label=tunnel)
+                    handler_id = item.connect('toggled', self.on_tunnel_toggled, tunnel)
+                    self.menu.append(item)
+                    
+                    self.tunnel_items[tunnel] = {
+                        "item": item,
+                        "handler_id": handler_id
+                    }
+
+            self.menu.append(Gtk.SeparatorMenuItem())
+            quit_item = Gtk.MenuItem(label="Quit")
+            quit_item.connect('activate', self.quit)
+            self.menu.append(quit_item)
+            self.menu.show_all()
+
+        # Update check states without triggering click handlers
+        for tunnel, data in self.tunnel_items.items():
+            item = data["item"]
+            handler_id = data["handler_id"]
+            should_be_active = tunnel in active_tunnels
+
+            if item.get_active() != should_be_active:
+                item.handler_block(handler_id)
+                item.set_active(should_be_active)
+                item.handler_unblock(handler_id)
+
+    def update_status(self):
+        available_tunnels = self.get_available_tunnels()
+        active_tunnels = self.get_active_interfaces()
+
+        self.update_menu(available_tunnels, active_tunnels)
+
+        # Set tray icon based on status, but keep hover text fixed to APP_TITLE
+        if active_tunnels:
+            icon_path = os.path.join(APPIMAGE_DIR, "wg-connected.svg")
+        else:
+            icon_path = os.path.join(APPIMAGE_DIR, "wg-disconnected.svg")
+
+        self.indicator.set_icon_full(icon_path, APP_TITLE)
+        self.indicator.set_title(APP_TITLE)
+
+        return True
+
+    def quit(self, source):
+        Gtk.main_quit()
+
+
+if __name__ == "__main__":
+    time.sleep(2)
+    app = WireGuardTray()
+    Gtk.main()

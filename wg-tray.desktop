@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Exec=python /home/sysop/bin/wireguard_tray/wg-tray
+NoDisplay=false
+Hidden=false
+Name=WireGuard Status
+X-GNOME-Autostart-Delay=3
